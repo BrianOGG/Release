@@ -4,6 +4,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to validate
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -19,10 +24,12 @@ jobs:
       - name: Validate release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern '*.yml' --pattern '*.zip' --dir release-assets
+          test -n "$RELEASE_TAG"
+          version="${RELEASE_TAG#v}"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.yml' --pattern '*.zip' --dir release-assets
           metadata_file="$(find release-assets -maxdepth 1 -type f -name '*.yml' -print -quit)"
           test -n "$metadata_file"
           VERSION="$version" METADATA_FILE="$metadata_file" node - <<'NODE'

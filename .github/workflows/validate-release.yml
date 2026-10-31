@@ -1,0 +1,38 @@
+name: Validate published release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Validate release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern 'nightly-mac.yml' --pattern '*.zip' --dir release-assets
+          VERSION="$version" node - <<'NODE'
+          const fs = require('fs')
+          const path = require('path')
+          const files = fs.readdirSync('release-assets')
+          if (!files.includes('nightly-mac.yml')) throw new Error('nightly-mac.yml is missing')
+          const metadata = JSON.parse(fs.readFileSync(path.join('release-assets', 'nightly-mac.yml'), 'utf8'))
+          const zip = metadata.path
+          if (!zip || !files.includes(zip)) throw new Error(`metadata path is missing: ${zip}`)
+          const stat = fs.statSync(path.join('release-assets', zip))
+          if (stat.size !== metadata.files[0].size) throw new Error('metadata size does not match ZIP')
+          if (metadata.version !== process.env.VERSION) throw new Error('metadata version mismatch')
+          console.log(JSON.stringify({ version: metadata.version, zip, size: stat.size }))
+          NODE

@@ -54,7 +54,8 @@ jobs:
           if (manifest.version !== expectedVersion) throw new Error('Linux package version does not match release tag')
           if (!/^[0-9a-f]{7,40}$/i.test(manifest.sourceCommit)) throw new Error('invalid source commit in package metadata')
           if (archiveName !== `cloud-agent-linux-web-${manifest.version}-linux-arm64.tar.gz`) throw new Error(`archive name does not match package version: ${archiveName}`)
-          const members = execFileSync('tar', ['-tzf', archive], { encoding: 'utf8' }).trim().split('\n')
+          // This runtime archive has many dependency files; exceed Node's 1 MiB default.
+          const members = execFileSync('tar', ['-tzf', archive], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trim().split('\n')
           const root = archiveName.slice(0, -'.tar.gz'.length)
           const required = ['install.sh', 'credentials.sh', 'backup.sh', 'restore.sh', 'rollback.sh', 'uninstall.sh', 'VERSION', 'RELEASE.json', 'NODE-LICENSE', 'runtime/bin/node', 'app/lib/cloud-agent.js', 'app/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html']
           for (const file of required) {

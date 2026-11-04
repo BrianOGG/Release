@@ -28,11 +28,46 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$RELEASE_TAG"
-          version="${RELEASE_TAG#v}"
-          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.yml' --pattern '*.zip' --dir release-assets
+          mkdir -p release-assets
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets
+
+          linux_validated=0
+          for archive in release-assets/*-linux-arm64.tar.gz; do
+            [[ -f "$archive" ]] || continue
+            linux_validated=1
+            manifest="${archive%.tar.gz}.json"
+            checksum="${archive}.sha256"
+            test -f "$manifest"
+            test -f "$checksum"
+            (cd release-assets && sha256sum -c "$(basename "$checksum")")
+            VERSION="${RELEASE_TAG#cloud-agent-v}" ARCHIVE="$archive" MANIFEST="$manifest" node - <<'NODE'
+          const fs = require('fs')
+          const path = require('path')
+          const { execFileSync } = require('child_process')
+          const archive = process.env.ARCHIVE
+          const manifestPath = process.env.MANIFEST
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+          const archiveName = path.basename(archive)
+          const expectedVersion = process.env.VERSION
+          if (manifest.product !== 'Cloud Agent Linux Web') throw new Error('unexpected Linux package product')
+          if (manifest.platform !== 'linux' || manifest.architecture !== 'arm64') throw new Error('unsupported Linux package platform')
+          if (manifest.version !== expectedVersion) throw new Error('Linux package version does not match release tag')
+          if (!/^[0-9a-f]{7,40}$/i.test(manifest.sourceCommit)) throw new Error('invalid source commit in package metadata')
+          if (archiveName !== `cloud-agent-linux-web-${manifest.version}-linux-arm64.tar.gz`) throw new Error(`archive name does not match package version: ${archiveName}`)
+          const members = execFileSync('tar', ['-tzf', archive], { encoding: 'utf8' }).trim().split('\n')
+          const root = archiveName.slice(0, -'.tar.gz'.length)
+          const required = ['install.sh', 'credentials.sh', 'backup.sh', 'restore.sh', 'rollback.sh', 'uninstall.sh', 'VERSION', 'RELEASE.json', 'NODE-LICENSE', 'runtime/bin/node', 'app/lib/cloud-agent.js', 'app/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html']
+          for (const file of required) {
+            if (!members.includes(`${root}/${file}`)) throw new Error(`package is missing ${file}`)
+          }
+          console.log(JSON.stringify({ product: manifest.product, version: manifest.version, architecture: manifest.architecture, archive: archiveName, files: members.length }))
+          NODE
+          done
+
           metadata_file="$(find release-assets -maxdepth 1 -type f -name '*.yml' -print -quit)"
-          test -n "$metadata_file"
-          VERSION="$version" METADATA_FILE="$metadata_file" node - <<'NODE'
+          if [[ -n "$metadata_file" ]]; then
+            version="${RELEASE_TAG#v}"
+            VERSION="$version" METADATA_FILE="$metadata_file" node - <<'NODE'
           const fs = require('fs')
           const path = require('path')
           const files = fs.readdirSync('release-assets')
@@ -45,3 +80,9 @@ jobs:
           if (metadata.version !== process.env.VERSION) throw new Error('metadata version mismatch')
           console.log(JSON.stringify({ version: metadata.version, metadata: metadataPath, zip, size: stat.size }))
           NODE
+          fi
+
+          if [[ "$linux_validated" -eq 0 && -z "$metadata_file" ]]; then
+            echo 'release has neither a valid Linux archive nor Electron updater metadata' >&2
+            exit 1
+          fi

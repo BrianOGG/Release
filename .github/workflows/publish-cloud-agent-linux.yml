@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download and verify the private CI artifact
+      - name: Download and verify the Release Actions artifact
         run: |
           set -euo pipefail
           [[ "$PACKAGE_VERSION" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]]
@@ -103,7 +103,7 @@ jobs:
           archive="${incoming}/cloud-agent-linux-web-${PACKAGE_VERSION}-linux-arm64.tar.gz"
           manifest="${incoming}/cloud-agent-linux-web-${PACKAGE_VERSION}-linux-arm64.json"
           checksum="${archive}.sha256"
-          notes=$(printf 'Linux ARM64 Web package built from private source commit %s.\n\nGitHub Actions build run: https://github.com/BrianOGG/cloud-agent/actions/runs/%s' "$SOURCE_SHA" "$SOURCE_RUN_ID")
+          notes=$(printf 'Linux ARM64 Web package built from private source commit %s.\n\nGitHub Actions build run: https://github.com/BrianOGG/Release/actions/runs/%s' "$SOURCE_SHA" "$SOURCE_RUN_ID")
 
           existing_release="$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" \
             --json isDraft,name,assets 2>/dev/null || true)"

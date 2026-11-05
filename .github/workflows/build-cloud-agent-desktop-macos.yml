@@ -1,0 +1,194 @@
+name: Build Cloud Agent Desktop OTA (Release repository)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: cloud-agent-desktop-ota
+  cancel-in-progress: false
+
+jobs:
+  build-macos-arm64:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CI: '1'
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: BrianOGG/cloud-agent
+          ref: main
+          token: ${{ secrets.CLOUD_AGENT_SOURCE_READ_TOKEN }}
+          path: cloud-agent-source
+          persist-credentials: false
+
+      - name: Record the checked out source commit
+        id: source
+        run: echo "sha=$(git -C cloud-agent-source rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release inputs and import the existing Apple identity
+        id: signing
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.CLOUD_AGENT_MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_P12_PASSWORD: ${{ secrets.CLOUD_AGENT_MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./cloud-agent-source/package.json').version")"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
+            echo 'Desktop OTA releases must be built from main.' >&2
+            exit 1
+          fi
+          if [[ -z "$CERTIFICATE_P12_BASE64" || -z "$CERTIFICATE_P12_PASSWORD" ]]; then
+            echo 'Add CLOUD_AGENT_MACOS_CERTIFICATE_P12_BASE64 and CLOUD_AGENT_MACOS_CERTIFICATE_PASSWORD to the Release repository Actions secrets.' >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --refs https://github.com/BrianOGG/Release.git "refs/tags/v${version}" >/dev/null; then
+            echo "Release v${version} already exists; increment the private package version before publishing." >&2
+            exit 1
+          else
+            tag_status=$?
+            if [[ "$tag_status" != '2' ]]; then
+              echo "Could not confirm the public Release tag state (git ls-remote exited with $tag_status)." >&2
+              exit "$tag_status"
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          keychain="$RUNNER_TEMP/cloud-agent-signing.keychain-db"
+          keychain_password="$(/usr/bin/openssl rand -hex 32)"
+          certificate="$RUNNER_TEMP/cloud-agent-signing.p12"
+          printf '%s' "$CERTIFICATE_P12_BASE64" | /usr/bin/openssl base64 -d -A -out "$certificate"
+          /usr/bin/security create-keychain -p "$keychain_password" "$keychain"
+          /usr/bin/security set-keychain-settings -lut 21600 "$keychain"
+          /usr/bin/security unlock-keychain -p "$keychain_password" "$keychain"
+          /usr/bin/security import "$certificate" -k "$keychain" -P "$CERTIFICATE_P12_PASSWORD" -T /usr/bin/codesign
+          /usr/bin/security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          /usr/bin/security list-keychains -d user -s "$keychain"
+          /usr/bin/security default-keychain -d user -s "$keychain"
+          identity_list="$(/usr/bin/security find-identity -v -p codesigning "$keychain")"
+          identity_count="$(printf '%s\n' "$identity_list" | /usr/bin/grep -c 'Apple Development:' || true)"
+          if [[ "$identity_count" != '1' ]]; then
+            echo 'The signing certificate must contain exactly one Apple Development identity.' >&2
+            exit 1
+          fi
+          expected_team="$(node -p "require('./cloud-agent-source/releases/0.2.6-r27.json').distribution.teamIdentifier")"
+          certificate_team="$(/usr/bin/security find-certificate -a -p -c 'Apple Development' "$keychain" \
+            | /usr/bin/openssl x509 -noout -subject -nameopt RFC2253 \
+            | /usr/bin/awk -F, '{ for (i=1; i<=NF; i++) if ($i ~ /^OU=/) { sub(/^OU=/, "", $i); print $i } }')"
+          if [[ "$certificate_team" != "$expected_team" ]]; then
+            echo "The Apple Development certificate OU must match the current OTA Team ID $expected_team (found: $certificate_team)." >&2
+            exit 1
+          fi
+          /bin/rm -f "$certificate"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Install the locked engine workspace
+        working-directory: cloud-agent-source/agent-engine
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore the pinned CUA driver input
+        working-directory: cloud-agent-source
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cua-driver-rs-0.36.0-darwin-universal.tar.gz"
+          curl --fail --location --retry 2 --retry-delay 1 --connect-timeout 15 --max-time 600 \
+            --output "$archive" \
+            'https://github.com/trycua/cua/releases/download/cua-driver-rs-v0.36.0/cua-driver-rs-0.36.0-darwin-universal.tar.gz'
+          echo '2a83cf9c3a2fa7ae27f3fe62e426aeca5acf76511bb14dd64d10ccb2de6aecae  '"$archive" | /usr/bin/shasum -a 256 -c -
+          mkdir -p .runtime/downloads
+          tar -xzf "$archive" -C .runtime/downloads
+          test -x .runtime/downloads/cua-driver-rs-0.36.0-darwin-universal/cua-driver
+
+      - name: Build the maintained Cloud Agent Desktop source
+        working-directory: cloud-agent-source
+        run: pnpm run package:client
+
+      - name: Create the OTA ZIP and update feed
+        working-directory: cloud-agent-source
+        env:
+          RELEASE_VERSION: ${{ steps.signing.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.sha }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          app="$GITHUB_WORKSPACE/cloud-agent-source/dist/releases/$RELEASE_VERSION/mac-arm64/Cloud Agent DSH.app"
+          output="$RUNNER_TEMP/cloud-agent-desktop-release"
+          node scripts/package_desktop_ota.mjs "$app" "$RELEASE_VERSION" "$SOURCE_COMMIT" "$output"
+          expected_team="$(node -p "require('./releases/0.2.6-r27.json').distribution.teamIdentifier")"
+          actual_team="$(node -p "require('$output/Cloud-Agent-DSH-' + process.env.RELEASE_VERSION + '-mac-arm64.json').teamIdentifier")"
+          [[ "$actual_team" == "$expected_team" ]]
+
+      - name: Upload the validated release bundle
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-agent-desktop-macos-arm64-${{ steps.signing.outputs.version }}
+          path: ${{ runner.temp }}/cloud-agent-desktop-release/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Dispatch the signed artifact to the Release publisher
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          VERSION: ${{ steps.signing.outputs.version }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+        run: |
+          node --input-type=module <<'NODE'
+          const token = process.env.GH_TOKEN
+          const repository = process.env.GITHUB_REPOSITORY
+          const base = `https://api.github.com/repos/${repository}`
+          const headers = {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+          }
+          if (!/^\d+$/u.test(process.env.ARTIFACT_ID ?? '')) throw new Error('invalid artifact ID')
+          if (!/^sha256:[0-9a-f]{64}$/u.test(process.env.ARTIFACT_DIGEST ?? '')) throw new Error('invalid artifact digest')
+          if (!/^[0-9a-f]{40}$/u.test(process.env.SOURCE_SHA ?? '')) throw new Error('invalid source commit')
+          const artifactResponse = await fetch(`${base}/actions/artifacts/${process.env.ARTIFACT_ID}/zip`, {
+            headers, redirect: 'manual',
+          })
+          if (artifactResponse.status !== 302) throw new Error(`artifact download URL returned HTTP ${artifactResponse.status}`)
+          const artifactUrl = artifactResponse.headers.get('location')
+          if (!artifactUrl) throw new Error('artifact download URL is missing')
+          const parsed = new URL(artifactUrl)
+          if (parsed.protocol !== 'https:' || parsed.username || parsed.password
+            || !(parsed.hostname.endsWith('.blob.core.windows.net')
+              || parsed.hostname.endsWith('.actions.githubusercontent.com'))) {
+            throw new Error('artifact download URL is outside approved GitHub Actions storage hosts')
+          }
+          const dispatch = await fetch(`${base}/dispatches`, {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              event_type: 'cloud-agent-desktop-macos-release',
+              client_payload: {
+                version: process.env.VERSION,
+                source_sha: process.env.SOURCE_SHA,
+                source_run_id: process.env.SOURCE_RUN_ID,
+                artifact_url: artifactUrl,
+                artifact_digest: process.env.ARTIFACT_DIGEST,
+              },
+            }),
+          })
+          if (dispatch.status !== 204) throw new Error(`Release publisher dispatch returned HTTP ${dispatch.status}`)
+          process.stdout.write(`Dispatched Cloud Agent Desktop ${process.env.VERSION} from source ${process.env.SOURCE_SHA}.\n`)
+          NODE

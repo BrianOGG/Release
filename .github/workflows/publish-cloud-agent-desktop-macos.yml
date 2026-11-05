@@ -19,7 +19,7 @@ jobs:
       ARTIFACT_URL: ${{ github.event.client_payload.artifact_url }}
       ARTIFACT_DIGEST: ${{ github.event.client_payload.artifact_digest }}
     steps:
-      - name: Download and verify the signed private CI artifact
+      - name: Download and verify the signed Release Actions artifact
         run: |
           set -euo pipefail
           [[ "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
@@ -125,7 +125,7 @@ jobs:
           archive="$incoming/Cloud-Agent-DSH-${PACKAGE_VERSION}-mac-arm64.zip"
           metadata="$incoming/nightly-mac.yml"
           manifest="$incoming/Cloud-Agent-DSH-${PACKAGE_VERSION}-mac-arm64.json"
-          notes="Cloud Agent DSH macOS arm64 OTA release built from private source commit ${SOURCE_SHA}. GitHub Actions build run: https://github.com/BrianOGG/cloud-agent/actions/runs/${SOURCE_RUN_ID}"
+          notes="Cloud Agent DSH macOS arm64 OTA release built from private source commit ${SOURCE_SHA}. GitHub Actions build run: https://github.com/BrianOGG/Release/actions/runs/${SOURCE_RUN_ID}"
           gh release create "$release_tag" "$archive" "$metadata" "$manifest" \
             --repo "$GITHUB_REPOSITORY" --title "Cloud Agent DSH ${PACKAGE_VERSION}" \
             --notes "$notes" --target main --draft

@@ -1,0 +1,281 @@
+name: Build Cloud Agent Linux Web release asset (Release repository)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Cloud Agent package version without a v prefix (for example 0.1.0)
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: cloud-agent-linux-web-build
+  cancel-in-progress: false
+
+jobs:
+  build-linux-arm64:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    container:
+      image: ubuntu:20.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: '1'
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - name: Install Linux build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential python3 pkg-config tar gzip xz-utils unzip
+
+      - uses: actions/checkout@v4
+        with:
+          repository: BrianOGG/cloud-agent
+          ref: main
+          token: ${{ secrets.CLOUD_AGENT_SOURCE_READ_TOKEN }}
+          path: cloud-agent-source
+          persist-credentials: false
+
+      - name: Record the checked out source commit
+        id: source
+        run: echo "sha=$(git -C cloud-agent-source rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate package version and release tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]]
+          release_tag="cloud-agent-v${VERSION}"
+          if git ls-remote --exit-code --refs https://github.com/BrianOGG/Release.git "refs/tags/${release_tag}" >/dev/null; then
+            echo "Release tag already exists: ${release_tag}" >&2
+            exit 1
+          else
+            tag_status=$?
+            if [[ "$tag_status" != '2' ]]; then
+              echo "Could not confirm the public Release tag state (git ls-remote exited with $tag_status)." >&2
+              exit "$tag_status"
+            fi
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.1
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Install locked workspace dependencies
+        working-directory: cloud-agent-source
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Cloud Agent runtime and Web UI
+        working-directory: cloud-agent-source/agent-engine
+        run: |
+          pnpm exec tsc -b packages/boot/app-boot/tsconfig.json apps/cli/tsconfig.json --pretty false
+          pnpm exec tsdown --config packages/boot/app-boot/tsdown.config.ts
+          pnpm exec tsdown --config apps/cli/tsdown.config.ts
+          pnpm exec tsc -b tsconfig.host.json --pretty false
+          pnpm exec tsdown --env.DSH_BUILD_FACE host
+          pnpm exec tsc -b tsconfig.client.json --pretty false
+          pnpm exec tsdown --env.DSH_BUILD_FACE client
+          pnpm --filter @deepseek-ai/dsh-web-frontend run build
+
+      - name: Stage the installable runtime dependency closure
+        working-directory: cloud-agent-source/agent-engine
+        run: >-
+          pnpm --filter @deepseek-ai/dsh deploy --prod --legacy
+          --config.inject-workspace-packages=true
+          --config.allow-unused-patches=true
+          --config.node-linker=hoisted
+          --config.link-workspace-packages=true
+          "$RUNNER_TEMP/cloud-agent-linux-app"
+
+      - name: Restore published Linux ARM64 native system binaries
+        working-directory: cloud-agent-source/agent-engine
+        run: |
+          set -euo pipefail
+          package_name='@deepseek-ai/node-addon-system-linux-arm64'
+          package_version="$(node -p "require('./native/system/packages/linux-arm64/package.json').version")"
+          tarball_name="$(npm pack "${package_name}@${package_version}" --pack-destination "$RUNNER_TEMP" --silent)"
+          tarball="$RUNNER_TEMP/$tarball_name"
+          package_dir="$RUNNER_TEMP/cloud-agent-linux-app/node_modules/@deepseek-ai/node-addon-system-linux-arm64"
+          test -f "$tarball"
+          rm -rf "$package_dir"
+          mkdir -p "$package_dir"
+          tar -xzf "$tarball" -C "$package_dir" --strip-components=1
+          test -f "$package_dir/bin/glibc/system.node"
+          test -f "$package_dir/bin/musl/system.node"
+          test -x "$package_dir/bin/landlock-run"
+
+      - name: Download and smoke-test pinned Chrome for Testing runtime
+        id: browser
+        working-directory: cloud-agent-source/agent-engine
+        run: |
+          set -euo pipefail
+          browser_version="$(cat apps/cli/packaging/linux/browser-runtime.version)"
+          [[ "$browser_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          bash -n apps/cli/packaging/linux/install.sh
+          browser_url="https://storage.googleapis.com/chrome-for-testing-public/$browser_version/linux-arm64/chrome-linux-arm64.zip"
+          browser_root="$RUNNER_TEMP/cloud-agent-browser-runtime"
+          browser_archive="$RUNNER_TEMP/chrome-linux-arm64.zip"
+          mkdir -p "$browser_root"
+          curl --fail --location --retry 2 --retry-delay 1 --connect-timeout 15 --max-time 600 \
+            --output "$browser_archive" "$browser_url"
+          unzip -q "$browser_archive" -d "$browser_root"
+          browser_dir="$browser_root/chrome-linux-arm64"
+          test -x "$browser_dir/chrome"
+          apt-get update
+          while IFS= read -r dependency; do
+            [[ -n "$dependency" ]] || continue
+            DEBIAN_FRONTEND=noninteractive apt-get satisfy -y --no-install-recommends "$dependency"
+          done < "$browser_dir/deb.deps"
+          browser_version_output="$("$browser_dir/chrome" --version)"
+          [[ "$browser_version_output" == *"$browser_version"* ]]
+          browser_html="$RUNNER_TEMP/cloud-agent-browser-smoke.html"
+          timeout 30s "$browser_dir/chrome" --headless --no-sandbox --disable-gpu \
+            --disable-dev-shm-usage --no-first-run --no-default-browser-check \
+            --user-data-dir="$browser_root/profile" \
+            --dump-dom 'data:text/html,%3Ctitle%3ECLOUD_AGENT_BROWSER_SMOKE_OK%3C%2Ftitle%3E' > "$browser_html"
+          grep -Fq '<title>CLOUD_AGENT_BROWSER_SMOKE_OK</title>' "$browser_html"
+          browser_sha256="$(sha256sum "$browser_archive" | awk '{print $1}')"
+          echo "sha256=$browser_sha256" >> "$GITHUB_OUTPUT"
+          echo "Chrome for Testing $browser_version ARM64 launch smoke passed"
+
+      - name: Package Linux Web installer
+        working-directory: cloud-agent-source/agent-engine
+        env:
+          CLOUD_AGENT_CHROME_SHA256: ${{ steps.browser.outputs.sha256 }}
+        run: >-
+          node scripts/package-cloud-agent-linux.mjs
+          --app "$RUNNER_TEMP/cloud-agent-linux-app"
+          --out "$RUNNER_TEMP/cloud-agent-linux-release"
+          --version "${{ inputs.version }}"
+          --source-commit "${{ steps.source.outputs.sha }}"
+          --browser-sha256 "$CLOUD_AGENT_CHROME_SHA256"
+
+      - name: Smoke-test packaged Cloud Agent Web startup
+        env:
+          CLOUD_AGENT_PACKAGE_VERSION: ${{ inputs.version }}
+          NODE_OPTIONS: --max-old-space-size=2048
+        run: |
+          set -euo pipefail
+          case "$CLOUD_AGENT_PACKAGE_VERSION" in
+            ''|*[!0-9A-Za-z.+_-]*) echo 'invalid package version for smoke test' >&2; exit 2 ;;
+          esac
+          package_name="cloud-agent-linux-web-${CLOUD_AGENT_PACKAGE_VERSION}-linux-arm64"
+          smoke_root="$RUNNER_TEMP/cloud-agent-linux-smoke"
+          archive="$RUNNER_TEMP/cloud-agent-linux-release/$package_name.tar.gz"
+          mkdir -m 700 -p "$smoke_root/home" "$smoke_root/dsh" "$smoke_root/tmp"
+          tar -xzf "$archive" -C "$smoke_root"
+          package_dir="$smoke_root/$package_name"
+          log_file="$smoke_root/startup.log"
+          cd "$package_dir/app"
+          env HOME="$smoke_root/home" DSH_HOME="$smoke_root/dsh" TMPDIR="$smoke_root/tmp" \
+            CLOUD_AGENT_NATIVE_SMOKE_FILE="$smoke_root/flock-smoke" \
+            "$package_dir/runtime/bin/node" --input-type=module -e '
+              import { open } from "node:fs/promises"
+              import { tryLockExclusive } from "@deepseek-ai/node-addon-system/flock"
+              const file = await open(process.env.CLOUD_AGENT_NATIVE_SMOKE_FILE, "a")
+              try { await tryLockExclusive(file.fd) } finally { await file.close() }
+              console.log("packaged Linux ARM64 flock addon passed")
+            '
+          env HOME="$smoke_root/home" DSH_HOME="$smoke_root/dsh" TMPDIR="$smoke_root/tmp" \
+            CLOUD_AGENT_WEB_PASSWORD='ci-smoke-password-123456' \
+            "$package_dir/runtime/bin/node" "$package_dir/app/lib/cloud-agent.js" \
+            --host 127.0.0.1 --port 19394 --no-open --trusted-host cloud-agent.invalid >"$log_file" 2>&1 &
+          service_pid=$!
+          login_page="$smoke_root/login.html"
+          cleanup() {
+            kill "$service_pid" 2>/dev/null || true
+            wait "$service_pid" 2>/dev/null || true
+            rm -rf "$smoke_root"
+          }
+          trap cleanup EXIT
+          http_status=000
+          for attempt in {1..30}; do
+            http_status="$(curl --max-time 1 -sS -o "$login_page" -w '%{http_code}' \
+              -H 'Host: cloud-agent.invalid' http://127.0.0.1:19394/_auth/login 2>/dev/null || true)"
+            if [[ "$http_status" == 200 ]]; then
+              grep -Fq 'name="username"' "$login_page"
+              grep -Fq 'name="password"' "$login_page"
+              echo 'packaged Cloud Agent Web trusted-host login form passed'
+              exit 0
+            fi
+            if ! kill -0 "$service_pid" 2>/dev/null; then
+              cat "$log_file"
+              exit 1
+            fi
+            sleep 0.5
+          done
+          cat "$log_file"
+          echo "packaged Cloud Agent Web startup timed out (HTTP $http_status)" >&2
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        id: upload
+        with:
+          name: cloud-agent-linux-arm64-${{ inputs.version }}
+          path: ${{ runner.temp }}/cloud-agent-linux-release/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Dispatch the package to the Release publisher
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+        run: |
+          node --input-type=module <<'NODE'
+          const token = process.env.GH_TOKEN
+          const repository = process.env.GITHUB_REPOSITORY
+          const base = `https://api.github.com/repos/${repository}`
+          const headers = {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+          }
+          if (!/^\d+$/u.test(process.env.ARTIFACT_ID ?? '')) throw new Error('invalid artifact ID')
+          if (!/^sha256:[0-9a-f]{64}$/u.test(process.env.ARTIFACT_DIGEST ?? '')) throw new Error('invalid artifact digest')
+          if (!/^[0-9a-f]{40}$/u.test(process.env.SOURCE_SHA ?? '')) throw new Error('invalid source commit')
+          const artifactResponse = await fetch(`${base}/actions/artifacts/${process.env.ARTIFACT_ID}/zip`, {
+            headers, redirect: 'manual',
+          })
+          if (artifactResponse.status !== 302) throw new Error(`artifact download URL returned HTTP ${artifactResponse.status}`)
+          const artifactUrl = artifactResponse.headers.get('location')
+          if (!artifactUrl) throw new Error('artifact download URL is missing')
+          const parsed = new URL(artifactUrl)
+          if (parsed.protocol !== 'https:' || parsed.username || parsed.password
+            || !(parsed.hostname.endsWith('.blob.core.windows.net')
+              || parsed.hostname.endsWith('.actions.githubusercontent.com'))) {
+            throw new Error('artifact download URL is outside approved GitHub Actions storage hosts')
+          }
+          const dispatch = await fetch(`${base}/dispatches`, {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              event_type: 'cloud-agent-linux-web-release',
+              client_payload: {
+                version: process.env.VERSION,
+                source_sha: process.env.SOURCE_SHA,
+                source_run_id: process.env.SOURCE_RUN_ID,
+                artifact_url: artifactUrl,
+                artifact_digest: process.env.ARTIFACT_DIGEST,
+              },
+            }),
+          })
+          if (dispatch.status !== 204) throw new Error(`Release publisher dispatch returned HTTP ${dispatch.status}`)
+          process.stdout.write(`Dispatched Cloud Agent Linux Web ${process.env.VERSION} from source ${process.env.SOURCE_SHA}.\n`)
+          NODE

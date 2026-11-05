@@ -25,12 +25,11 @@ jobs:
           repository: BrianOGG/cloud-agent
           ref: main
           token: ${{ secrets.CLOUD_AGENT_SOURCE_READ_TOKEN }}
-          path: cloud-agent-source
           persist-credentials: false
 
       - name: Record the checked out source commit
         id: source
-        run: echo "sha=$(git -C cloud-agent-source rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Validate release inputs and import the existing Apple identity
         id: signing
@@ -39,7 +38,7 @@ jobs:
           CERTIFICATE_P12_PASSWORD: ${{ secrets.CLOUD_AGENT_MACOS_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
-          version="$(node -p "require('./cloud-agent-source/package.json').version")"
+          version="$(node -p "require('./package.json').version")"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
           if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
             echo 'Desktop OTA releases must be built from main.' >&2
@@ -78,7 +77,7 @@ jobs:
             echo 'The signing certificate must contain exactly one Apple Development identity.' >&2
             exit 1
           fi
-          expected_team="$(node -p "require('./cloud-agent-source/releases/0.2.6-r27.json').distribution.teamIdentifier")"
+          expected_team="$(node -p "require('./releases/0.2.6-r27.json').distribution.teamIdentifier")"
           certificate_team="$(/usr/bin/security find-certificate -a -p -c 'Apple Development' "$keychain" \
             | /usr/bin/openssl x509 -noout -subject -nameopt RFC2253 \
             | /usr/bin/awk -F, '{ for (i=1; i<=NF; i++) if ($i ~ /^OU=/) { sub(/^OU=/, "", $i); print $i } }')"
@@ -97,11 +96,10 @@ jobs:
           version: 11.7.0
 
       - name: Install the locked engine workspace
-        working-directory: cloud-agent-source/agent-engine
+        working-directory: agent-engine
         run: pnpm install --frozen-lockfile
 
       - name: Restore the pinned CUA driver input
-        working-directory: cloud-agent-source
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/cua-driver-rs-0.36.0-darwin-universal.tar.gz"
@@ -114,18 +112,18 @@ jobs:
           test -x .runtime/downloads/cua-driver-rs-0.36.0-darwin-universal/cua-driver
 
       - name: Build the maintained Cloud Agent Desktop source
-        working-directory: cloud-agent-source
-        run: pnpm run package:client
+        run: |
+          set -o pipefail
+          pnpm run package:client 2>&1 | sed -E 's#(https?://[^[:space:]]*[?&]token=)[^[:space:]]+#\1[REDACTED]#g'
 
       - name: Create the OTA ZIP and update feed
-        working-directory: cloud-agent-source
         env:
           RELEASE_VERSION: ${{ steps.signing.outputs.version }}
           SOURCE_COMMIT: ${{ steps.source.outputs.sha }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          app="$GITHUB_WORKSPACE/cloud-agent-source/dist/releases/$RELEASE_VERSION/mac-arm64/Cloud Agent DSH.app"
+          app="$GITHUB_WORKSPACE/dist/releases/$RELEASE_VERSION/mac-arm64/Cloud Agent DSH.app"
           output="$RUNNER_TEMP/cloud-agent-desktop-release"
           node scripts/package_desktop_ota.mjs "$app" "$RELEASE_VERSION" "$SOURCE_COMMIT" "$output"
           expected_team="$(node -p "require('./releases/0.2.6-r27.json').distribution.teamIdentifier")"

@@ -24,7 +24,6 @@ jobs:
           repository: BrianOGG/cloud-agent
           ref: main
           token: ${{ secrets.CLOUD_AGENT_SOURCE_READ_TOKEN }}
-          path: cloud-agent-source
           persist-credentials: false
 
       - uses: actions/setup-node@v4
@@ -36,34 +35,32 @@ jobs:
           version: 11.7.0
 
       - name: Install the locked engine workspace
-        working-directory: cloud-agent-source/agent-engine
+        working-directory: agent-engine
         run: pnpm install --frozen-lockfile
 
       - name: Build the desktop host dependencies
-        working-directory: cloud-agent-source/agent-engine
+        working-directory: agent-engine
         run: pnpm run build:lib:host
 
       - name: Compile the desktop host and Cloud Agent overlay
-        working-directory: cloud-agent-source
         run: node scripts/prepare_desktop_build.mjs
 
       - name: Check the Electron entry syntax
-        working-directory: cloud-agent-source
         run: node --check client/entry.mjs
 
       - name: Run the focused Desktop locale checks
-        working-directory: cloud-agent-source/agent-engine
+        working-directory: agent-engine
         run: pnpm exec vitest run apps/desktop/tests/locale.spec.ts --maxWorkers=1
 
       - name: Check Cloud Agent startup without DSH authentication
-        working-directory: cloud-agent-source/agent-engine
+        working-directory: agent-engine
         run: >-
           pnpm exec vitest run apps/desktop/tests/main-startup.spec.ts
           -t "enters Cloud Agent workspace without DSH authentication"
           --maxWorkers=1
 
       - name: Run the CUA Driver MCP lifecycle and composition checks
-        working-directory: cloud-agent-source/agent-engine
+        working-directory: agent-engine
         run: >-
           pnpm exec vitest run
           packages/experimental/computer-use-cua-driver-mcp/tests/lifecycle.spec.ts

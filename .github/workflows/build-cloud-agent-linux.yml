@@ -41,12 +41,11 @@ jobs:
           repository: BrianOGG/cloud-agent
           ref: main
           token: ${{ secrets.CLOUD_AGENT_SOURCE_READ_TOKEN }}
-          path: cloud-agent-source
           persist-credentials: false
 
       - name: Record the checked out source commit
         id: source
-        run: echo "sha=$(git -C cloud-agent-source rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Validate package version and release tag
         env:
@@ -75,11 +74,10 @@ jobs:
           version: 11.7.0
 
       - name: Install locked workspace dependencies
-        working-directory: cloud-agent-source
         run: pnpm install --frozen-lockfile
 
       - name: Build Cloud Agent runtime and Web UI
-        working-directory: cloud-agent-source/agent-engine
+        working-directory: agent-engine
         run: |
           pnpm exec tsc -b packages/boot/app-boot/tsconfig.json apps/cli/tsconfig.json --pretty false
           pnpm exec tsdown --config packages/boot/app-boot/tsdown.config.ts
@@ -91,7 +89,7 @@ jobs:
           pnpm --filter @deepseek-ai/dsh-web-frontend run build
 
       - name: Stage the installable runtime dependency closure
-        working-directory: cloud-agent-source/agent-engine
+        working-directory: agent-engine
         run: >-
           pnpm --filter @deepseek-ai/dsh deploy --prod --legacy
           --config.inject-workspace-packages=true
@@ -101,7 +99,7 @@ jobs:
           "$RUNNER_TEMP/cloud-agent-linux-app"
 
       - name: Restore published Linux ARM64 native system binaries
-        working-directory: cloud-agent-source/agent-engine
+        working-directory: agent-engine
         run: |
           set -euo pipefail
           package_name='@deepseek-ai/node-addon-system-linux-arm64'
@@ -119,7 +117,7 @@ jobs:
 
       - name: Download and smoke-test pinned Chrome for Testing runtime
         id: browser
-        working-directory: cloud-agent-source/agent-engine
+        working-directory: agent-engine
         run: |
           set -euo pipefail
           browser_version="$(cat apps/cli/packaging/linux/browser-runtime.version)"
@@ -152,7 +150,7 @@ jobs:
           echo "Chrome for Testing $browser_version ARM64 launch smoke passed"
 
       - name: Package Linux Web installer
-        working-directory: cloud-agent-source/agent-engine
+        working-directory: agent-engine
         env:
           CLOUD_AGENT_CHROME_SHA256: ${{ steps.browser.outputs.sha256 }}
         run: >-

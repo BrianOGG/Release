@@ -1,0 +1,141 @@
+name: Publish Cloud Agent Linux Web package
+
+on:
+  repository_dispatch:
+    types: [cloud-agent-linux-web-release]
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  publish-linux-web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PACKAGE_VERSION: ${{ github.event.client_payload.version }}
+      SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+      SOURCE_RUN_ID: ${{ github.event.client_payload.source_run_id }}
+      ARTIFACT_URL: ${{ github.event.client_payload.artifact_url }}
+      ARTIFACT_DIGEST: ${{ github.event.client_payload.artifact_digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and verify the private CI artifact
+        run: |
+          set -euo pipefail
+          [[ "$PACKAGE_VERSION" =~ ^[0-9][0-9A-Za-z.+_-]*$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{7,40}$ ]]
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test -n "$ARTIFACT_URL"
+
+          node --input-type=module - <<'NODE'
+          const url = new URL(process.env.ARTIFACT_URL)
+          const host = url.hostname.toLowerCase()
+          const allowed = host.endsWith('.blob.core.windows.net') || host.endsWith('.actions.githubusercontent.com')
+          if (url.protocol !== 'https:' || url.username || url.password || !allowed) {
+            throw new Error('artifact URL is not an HTTPS GitHub Actions artifact storage URL')
+          }
+          NODE
+
+          incoming="$RUNNER_TEMP/cloud-agent-linux-incoming"
+          archive_name="cloud-agent-linux-web-${PACKAGE_VERSION}-linux-arm64.tar.gz"
+          manifest_name="cloud-agent-linux-web-${PACKAGE_VERSION}-linux-arm64.json"
+          checksum_name="${archive_name}.sha256"
+          mkdir -m 700 -p "$incoming"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 2 --retry-delay 1 --max-time 600 \
+            "$ARTIFACT_URL" -o "$incoming/actions-artifact.zip"
+          actual_digest="sha256:$(sha256sum "$incoming/actions-artifact.zip" | awk '{print $1}')"
+          if [[ "$actual_digest" != "$ARTIFACT_DIGEST" ]]; then
+            echo 'Actions artifact digest does not match the authenticated artifact metadata' >&2
+            exit 1
+          fi
+          unzip -q "$incoming/actions-artifact.zip" -d "$incoming/files"
+
+          archive="$incoming/files/$archive_name"
+          manifest="$incoming/files/$manifest_name"
+          checksum="$incoming/files/$checksum_name"
+          test -s "$archive"
+          test -s "$manifest"
+          test -s "$checksum"
+          (cd "$incoming/files" && sha256sum -c "$checksum_name")
+
+          VERSION="$PACKAGE_VERSION" SOURCE_SHA="$SOURCE_SHA" MANIFEST="$manifest" ARCHIVE="$archive" node - <<'NODE'
+          const fs = require('node:fs')
+          const { execFileSync } = require('node:child_process')
+          const manifest = JSON.parse(fs.readFileSync(process.env.MANIFEST, 'utf8'))
+          const expected = {
+            product: 'Cloud Agent Linux Web',
+            version: process.env.VERSION,
+            sourceCommit: process.env.SOURCE_SHA.toLowerCase(),
+            platform: 'linux',
+            architecture: 'arm64',
+          }
+          for (const [key, value] of Object.entries(expected)) {
+            const actual = key === 'sourceCommit' ? String(manifest[key]).toLowerCase() : manifest[key]
+            if (actual !== value) throw new Error(`package manifest ${key} mismatch`)
+          }
+          const archiveName = `cloud-agent-linux-web-${process.env.VERSION}-linux-arm64.tar.gz`
+          const entries = execFileSync('tar', ['-tzf', process.env.ARCHIVE], {
+            encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+          }).trim().split('\n')
+          const root = archiveName.slice(0, -'.tar.gz'.length)
+          const required = [
+            'install.sh', 'credentials.sh', 'backup.sh', 'restore.sh', 'rollback.sh',
+            'uninstall.sh', 'VERSION', 'RELEASE.json', 'NODE-LICENSE', 'runtime/bin/node',
+            'app/lib/cloud-agent.js', 'app/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html',
+          ]
+          for (const file of required) {
+            if (!entries.includes(`${root}/${file}`)) throw new Error(`package is missing ${file}`)
+          }
+          console.log(JSON.stringify({ version: manifest.version, sourceCommit: manifest.sourceCommit, files: entries.length }))
+          NODE
+
+      - name: Create draft, run the release validator, and publish
+        run: |
+          set -euo pipefail
+          release_tag="cloud-agent-v${PACKAGE_VERSION}"
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release already exists: $release_tag" >&2
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" >/dev/null 2>&1; then
+            echo "release tag already exists: $release_tag" >&2
+            exit 1
+          fi
+
+          incoming="$RUNNER_TEMP/cloud-agent-linux-incoming/files"
+          archive="${incoming}/cloud-agent-linux-web-${PACKAGE_VERSION}-linux-arm64.tar.gz"
+          manifest="${incoming}/cloud-agent-linux-web-${PACKAGE_VERSION}-linux-arm64.json"
+          checksum="${archive}.sha256"
+          notes=$(printf 'Linux ARM64 Web package built from private source commit %s.\n\nGitHub Actions build run: https://github.com/BrianOGG/cloud-agent/actions/runs/%s' "$SOURCE_SHA" "$SOURCE_RUN_ID")
+          gh release create "$release_tag" "$archive" "$manifest" "$checksum" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Cloud Agent Linux Web ${PACKAGE_VERSION}" \
+            --notes "$notes" \
+            --target main --draft --prerelease
+
+          previous_run="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow validate-release.yml \
+            --event workflow_dispatch --limit 20 --json databaseId --jq 'map(.databaseId) | max // 0')"
+          gh workflow run validate-release.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            --field release_tag="$release_tag"
+
+          validator_run=''
+          for attempt in {1..30}; do
+            validator_run="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow validate-release.yml \
+              --event workflow_dispatch --limit 20 --json databaseId \
+              --jq "map(select(.databaseId > ${previous_run})) | map(.databaseId) | max // empty")"
+            if [[ -n "$validator_run" ]]; then break; fi
+            sleep 2
+          done
+          if [[ -z "$validator_run" ]]; then
+            echo 'release validation workflow did not start' >&2
+            exit 1
+          fi
+          gh run watch "$validator_run" --repo "$GITHUB_REPOSITORY" --exit-status
+
+          gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
+          echo "Published $release_tag after the release validator passed."

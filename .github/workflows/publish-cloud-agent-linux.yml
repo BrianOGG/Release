@@ -94,30 +94,59 @@ jobs:
           console.log(JSON.stringify({ version: manifest.version, sourceCommit: manifest.sourceCommit, files: entries.length }))
           NODE
 
-      - name: Create draft, run the release validator, and publish
+      - name: Publish the validated package and verify the public assets
         run: |
           set -euo pipefail
           release_tag="cloud-agent-v${PACKAGE_VERSION}"
-          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release already exists: $release_tag" >&2
-            exit 1
-          fi
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" >/dev/null 2>&1; then
-            echo "release tag already exists: $release_tag" >&2
-            exit 1
-          fi
-
+          title="Cloud Agent Linux Web ${PACKAGE_VERSION}"
           incoming="$RUNNER_TEMP/cloud-agent-linux-incoming/files"
           archive="${incoming}/cloud-agent-linux-web-${PACKAGE_VERSION}-linux-arm64.tar.gz"
           manifest="${incoming}/cloud-agent-linux-web-${PACKAGE_VERSION}-linux-arm64.json"
           checksum="${archive}.sha256"
           notes=$(printf 'Linux ARM64 Web package built from private source commit %s.\n\nGitHub Actions build run: https://github.com/BrianOGG/cloud-agent/actions/runs/%s' "$SOURCE_SHA" "$SOURCE_RUN_ID")
-          gh release create "$release_tag" "$archive" "$manifest" "$checksum" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Cloud Agent Linux Web ${PACKAGE_VERSION}" \
-            --notes "$notes" \
-            --target main --draft --prerelease
 
+          existing_release="$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,name,assets 2>/dev/null || true)"
+          if [[ -n "$existing_release" ]]; then
+            if [[ "$(jq -r '.isDraft' <<<"$existing_release")" != 'true' || \
+                  "$(jq -r '.name' <<<"$existing_release")" != "$title" ]]; then
+              echo "an incompatible or already published release exists: $release_tag" >&2
+              exit 1
+            fi
+            existing_count="$(jq '.assets | length' <<<"$existing_release")"
+            if [[ "$existing_count" -ne 3 ]]; then
+              echo "draft release has an unexpected asset count: $existing_count" >&2
+              exit 1
+            fi
+            for asset in "$archive" "$manifest" "$checksum"; do
+              asset_name="$(basename "$asset")"
+              expected_digest="sha256:$(sha256sum "$asset" | awk '{print $1}')"
+              current_digest="$(jq -r --arg name "$asset_name" \
+                '.assets[] | select(.name == $name) | (.digest // "")' <<<"$existing_release")"
+              if [[ -z "$current_digest" ]]; then
+                echo "draft release is missing asset: $asset_name" >&2
+                exit 1
+              fi
+              if [[ "$current_digest" != "$expected_digest" ]]; then
+                gh release upload "$release_tag" "$asset" \
+                  --repo "$GITHUB_REPOSITORY" --clobber
+              fi
+            done
+          else
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$release_tag" >/dev/null 2>&1; then
+              echo "release tag already exists without a usable draft: $release_tag" >&2
+              exit 1
+            fi
+            gh release create "$release_tag" "$archive" "$manifest" "$checksum" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --notes "$notes" \
+              --target main --draft --prerelease
+          fi
+          gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" \
+            --title "$title" --notes "$notes" --draft --prerelease
+
+          gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
           previous_run="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow validate-release.yml \
             --event workflow_dispatch --limit 20 --json databaseId --jq 'map(.databaseId) | max // 0')"
           gh workflow run validate-release.yml --repo "$GITHUB_REPOSITORY" --ref main \
@@ -133,9 +162,12 @@ jobs:
           done
           if [[ -z "$validator_run" ]]; then
             echo 'release validation workflow did not start' >&2
+            gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft --prerelease
             exit 1
           fi
-          gh run watch "$validator_run" --repo "$GITHUB_REPOSITORY" --exit-status
-
-          gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
-          echo "Published $release_tag after the release validator passed."
+          if ! gh run watch "$validator_run" --repo "$GITHUB_REPOSITORY" --exit-status; then
+            gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft --prerelease
+            echo "public asset validation failed; $release_tag returned to draft" >&2
+            exit 1
+          fi
+          echo "Published $release_tag after public asset validation passed."

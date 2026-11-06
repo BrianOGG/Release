@@ -37,6 +37,7 @@ jobs:
             ca-certificates curl git build-essential python3 pkg-config tar gzip xz-utils unzip
 
       - uses: actions/checkout@v4
+        id: checkout_source
         with:
           repository: BrianOGG/cloud-agent
           ref: main
@@ -45,9 +46,7 @@ jobs:
 
       - name: Record the checked out source commit
         id: source
-        run: |
-          source_sha="$(git -c safe.directory="$GITHUB_WORKSPACE" -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
-          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+        run: echo "sha=${{ steps.checkout_source.outputs.commit }}" >> "$GITHUB_OUTPUT"
 
       - name: Validate package version and release tag
         env:

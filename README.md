@@ -4,7 +4,7 @@ Public release repository for Cloud Agent Linux Web packages, macOS Desktop inst
 
 ## Workflows
 
-- `Cloud Agent Desktop source CI`: manually checks the private Desktop source on a macOS runner.
+- `Cloud Agent Desktop source CI`: manually checks and compiles the private Desktop source on an Ubuntu runner; signed macOS packaging remains on the macOS OTA workflow.
 - `Build Cloud Agent Desktop OTA`: manually builds and signs the private source, then dispatches its verified artifact to the macOS OTA publisher in this repository.
 - `Build Cloud Agent Linux Web release asset`: manually builds the private source, then dispatches its verified artifact to the Linux publisher in this repository.
 - The publisher workflows validate artifacts and public release assets. Linux publication also invokes `Validate published release`.

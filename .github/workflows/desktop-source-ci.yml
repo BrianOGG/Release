@@ -59,6 +59,15 @@ jobs:
           -t "enters Cloud Agent workspace without DSH authentication"
           --maxWorkers=1
 
+      - name: Run the Desktop renderer title checks
+        working-directory: agent-engine
+        run: >-
+          pnpm exec vitest run
+          apps/web/tests/desktop-boot.spec.ts
+          packages/client/ui-layout/tests/app-frame.client.spec.tsx
+          -t "forwards client initialization failures|uses the Desktop product title ahead of the client build title"
+          --maxWorkers=1
+
       - name: Run the CUA Driver MCP lifecycle and composition checks
         working-directory: agent-engine
         run: >-

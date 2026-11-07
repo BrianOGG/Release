@@ -94,6 +94,20 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 11.7.0
+          cache: true
+          cache_dependency_path: agent-engine/pnpm-lock.yaml
+
+      - name: Restore incremental TypeScript outputs
+        id: typescript-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/cloud-agent-typescript-outputs.tar
+          key: cloud-agent-tsbuild-${{ runner.os }}-node24-pnpm11.7-${{ hashFiles('agent-engine/pnpm-lock.yaml', 'agent-engine/**/tsconfig*.json', 'agent-engine/**/package.json', 'agent-engine/**/package.yaml') }}-${{ steps.source.outputs.sha }}
+          restore-keys: |
+            cloud-agent-tsbuild-${{ runner.os }}-node24-pnpm11.7-${{ hashFiles('agent-engine/pnpm-lock.yaml', 'agent-engine/**/tsconfig*.json', 'agent-engine/**/package.json', 'agent-engine/**/package.yaml') }}-
+
+      - name: Apply restored TypeScript outputs
+        run: node scripts/cache_typescript_outputs.mjs restore "$RUNNER_TEMP/cloud-agent-typescript-outputs.tar"
 
       - name: Install the locked engine workspace
         working-directory: agent-engine
@@ -115,6 +129,17 @@ jobs:
         run: |
           set -o pipefail
           pnpm run package:client 2>&1 | sed -E 's#(https?://[^[:space:]]*[?&]token=)[^[:space:]]+#\1[REDACTED]#g'
+
+      - name: Archive incremental TypeScript outputs
+        if: success()
+        run: node scripts/cache_typescript_outputs.mjs archive "$RUNNER_TEMP/cloud-agent-typescript-outputs.tar"
+
+      - name: Save incremental TypeScript outputs
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/cloud-agent-typescript-outputs.tar
+          key: ${{ steps.typescript-cache.outputs.cache-primary-key }}
 
       - name: Create the OTA ZIP and update feed
         env:

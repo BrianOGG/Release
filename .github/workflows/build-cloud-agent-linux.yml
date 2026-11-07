@@ -251,7 +251,7 @@ jobs:
           name: cloud-agent-linux-arm64-${{ inputs.version }}
           path: ${{ runner.temp }}/cloud-agent-linux-release/*
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1
 
       - name: Dispatch the package to the Release publisher
         env:
@@ -295,6 +295,7 @@ jobs:
                 version: process.env.VERSION,
                 source_sha: process.env.SOURCE_SHA,
                 source_run_id: process.env.SOURCE_RUN_ID,
+                artifact_id: process.env.ARTIFACT_ID,
                 artifact_url: artifactUrl,
                 artifact_digest: process.env.ARTIFACT_DIGEST,
               },

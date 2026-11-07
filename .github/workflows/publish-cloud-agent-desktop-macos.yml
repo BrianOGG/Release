@@ -5,6 +5,7 @@ on:
     types: [cloud-agent-desktop-macos-release]
 
 permissions:
+  actions: write
   contents: write
 
 jobs:
@@ -18,6 +19,7 @@ jobs:
       SOURCE_RUN_ID: ${{ github.event.client_payload.source_run_id }}
       ARTIFACT_URL: ${{ github.event.client_payload.artifact_url }}
       ARTIFACT_DIGEST: ${{ github.event.client_payload.artifact_digest }}
+      ARTIFACT_ID: ${{ github.event.client_payload.artifact_id }}
     steps:
       - name: Download and verify the signed Release Actions artifact
         run: |
@@ -152,3 +154,18 @@ jobs:
             exit 1
           fi
           echo "Published and verified ${release_tag}; latest/download now contains the macOS arm64 OTA feed."
+
+      - name: Delete the source Actions artifact after verified release
+        if: success()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [[ ! "${ARTIFACT_ID:-}" =~ ^[0-9]+$ ]]; then
+            echo "::warning::Source Actions artifact ID is missing or invalid; skipping cleanup."
+            exit 0
+          fi
+          if gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID"; then
+            echo "Deleted source Actions artifact $ARTIFACT_ID"
+          else
+            echo "::warning::Could not delete source Actions artifact $ARTIFACT_ID; the verified Release remains available."
+          fi
